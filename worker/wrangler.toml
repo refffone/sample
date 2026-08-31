@@ -1,0 +1,41 @@
+# This name must exactly match the Worker's name in the Cloudflare dashboard
+# (Workers & Pages -> your Worker) or Git-integration builds fail. If you
+# rename the dashboard Worker, update this to match, not the other way round.
+name = "inventory-log"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "receiving-log-db"
+database_id = "6003a115-51c6-4261-bb26-ae88b38644b9"
+
+# Runs every hour, purging receipts checked more than 24h ago.
+[triggers]
+crons = ["0 * * * *"]
+
+# Secrets (set with `wrangler secret put <NAME>`, or in the dashboard
+# under Settings -> Variables and Secrets — do NOT put real values here):
+#   WAREHOUSE_PASSWORD     shared password for the Warehouse role
+#   QUALITY_PASSWORD       shared password for the Quality role
+#   AUTH_SECRET            any long random string, signs login tokens
+#   VAPID_PRIVATE_KEY_JWK  private key for push notifications (see README)
+#   VAPID_SUBJECT          "mailto:you@yourcompany.com" — contact info push
+#                          services may use if there's a delivery problem
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+redact_query_string = false
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
+
