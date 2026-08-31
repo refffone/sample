@@ -451,7 +451,11 @@ const HTML = `<!doctype html>
   .app-wrap { max-width:860px; margin:0 auto; padding:16px 16px calc(80px + env(safe-area-inset-bottom)); }
   @media (min-width:640px) { .app-wrap { padding:24px 20px 80px; } }
 
-  .minibar { display:flex; align-items:center; justify-content:space-between; gap:10px; padding-bottom:16px; flex-wrap:wrap; }
+  /* padding-right reserves room for .corner-controls, which is position:fixed
+     and so no longer takes up space in this row's own flex layout — without
+     it, the fixed buttons just paint on top of the brand text instead of
+     leaving room for it. */
+  .minibar { display:flex; align-items:center; justify-content:space-between; gap:10px; padding-bottom:16px; padding-right:calc(112px + env(safe-area-inset-right)); flex-wrap:wrap; }
   .minibrand { display:flex; align-items:center; gap:8px; min-width:0; }
   .minibrand img { height:26px; width:auto; max-width:130px; object-fit:contain; display:block; flex:none; }
   .minibrand span { font-size:0.82rem; font-weight:600; color:var(--ink-soft); letter-spacing:0.02em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -470,7 +474,8 @@ const HTML = `<!doctype html>
      second click lands nowhere. */
   .corner-controls {
     position:fixed; top:calc(12px + env(safe-area-inset-top)); right:calc(12px + env(safe-area-inset-right)); z-index:30;
-    display:flex; align-items:center; gap:8px; direction:ltr;
+    display:flex; align-items:center; gap:8px; direction:ltr; flex-wrap:wrap; justify-content:flex-end;
+    max-width:calc(100vw - 24px - env(safe-area-inset-right));
   }
 
   .install-btn { background:var(--accent-wash); border-color:transparent; color:var(--accent); }
@@ -522,7 +527,9 @@ const HTML = `<!doctype html>
 
   .login-note { font-size:0.76rem; color:var(--ink-soft); background:var(--surface-sunken); border-radius:8px; padding:10px 12px; line-height:1.5; }
 
-  header.topbar { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:18px; }
+  /* padding-right reserves room for .corner-controls (position:fixed, see
+     .minibar above for why). */
+  header.topbar { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:18px; padding-right:calc(112px + env(safe-area-inset-right)); }
   .brand { display:flex; align-items:center; gap:10px; min-width:0; }
   .brand img { height:30px; width:auto; max-width:150px; object-fit:contain; display:block; flex:none; }
   @media (min-width:480px) { .brand img { height:34px; } }
