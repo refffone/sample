@@ -1,7 +1,7 @@
 # This name must exactly match the Worker's name in the Cloudflare dashboard
 # (Workers & Pages -> your Worker) or Git-integration builds fail. If you
 # rename the dashboard Worker, update this to match, not the other way round.
-name = "sample"
+name = "inventory-log"
 main = "src/index.js"
 compatibility_date = "2024-09-23"
 
