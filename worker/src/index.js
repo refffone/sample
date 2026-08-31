@@ -605,9 +605,15 @@ const HTML = `<!doctype html>
   .status-pill { font-size:0.66rem; text-transform:uppercase; letter-spacing:0.08em; font-weight:700; padding:3px 9px; border-radius:999px; background:var(--pending-wash); color:var(--pending); }
   .receipt-row.checked .status-pill { background:var(--good-wash); color:var(--good); }
 
-  .item-list { display:flex; flex-direction:column; gap:4px; }
-  .item-line { display:flex; flex-wrap:wrap; gap:4px 10px; font-size:0.83rem; color:var(--ink-soft); }
-  .item-line .mono { color:var(--ink); font-weight:600; flex:none; }
+  .item-list { display:flex; flex-direction:column; gap:8px; }
+  .item-card { background:var(--surface-sunken); border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
+  .item-card-head { display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; margin-bottom:5px; }
+  .item-code { font-weight:600; color:var(--ink); font-size:0.85rem; }
+  .item-pkg { font-size:0.66rem; text-transform:uppercase; letter-spacing:0.05em; font-weight:700; color:var(--accent); background:var(--accent-wash); padding:2px 8px; border-radius:999px; white-space:nowrap; }
+  .item-stats { display:flex; flex-wrap:wrap; gap:4px 16px; }
+  .stat { display:flex; align-items:baseline; gap:5px; font-size:0.78rem; }
+  .stat-label { color:var(--ink-soft); }
+  .stat-value { color:var(--ink); font-weight:600; }
   .receipt-timestamps { font-size:0.76rem; color:var(--ink-soft); display:flex; gap:14px; flex-wrap:wrap; }
 
   .receipt-actions { grid-column:2; display:flex; align-items:center; padding:0 14px 13px; border-inline-start:none; border-top:1px solid var(--border); margin-top:2px; padding-top:11px; justify-content:flex-end; }
@@ -842,8 +848,8 @@ const HTML = `<!doctype html>
   }
 
   const T = {
-    en: { supplier: 'Supplier:', pallets: 'pallets', pallet: 'pallet', unit: 'unit', units: 'units', bags: 'bags', total: 'Total', received: 'Received', by: 'By', checked: 'Checked', checkedBy: 'by', warehouse: 'Warehouse', quality: 'Quality', pending: 'Pending', markChecked: 'Mark Checked', clearsIn: 'Clears in', networkErr: 'Could not reach the server. Try again.', loggedOk: 'Receipt logged.', checkedOk: 'Marked as checked.' },
-    ar: { supplier: 'المورّد:', pallets: 'باليت', pallet: 'باليت', unit: 'وحدة', units: 'وحدة', bags: 'كيس', total: 'الإجمالي', received: 'تاريخ الاستلام', by: 'بواسطة', checked: 'تم الفحص', checkedBy: 'بواسطة', warehouse: 'المستودع', quality: 'الجودة', pending: 'بالانتظار', markChecked: 'وضع علامة تم الفحص', clearsIn: 'سيُحذف خلال', networkErr: 'تعذّر الوصول إلى الخادم. حاول مرة أخرى.', loggedOk: 'تم تسجيل الاستلام.', checkedOk: 'تم وضع علامة الفحص.' },
+    en: { supplier: 'Supplier:', pallets: 'pallets', pallet: 'pallet', unit: 'unit', units: 'units', bags: 'bags', total: 'Total', received: 'Received', by: 'By', checked: 'Checked', checkedBy: 'by', warehouse: 'Warehouse', quality: 'Quality', pending: 'Pending', markChecked: 'Mark Checked', clearsIn: 'Clears in', networkErr: 'Could not reach the server. Try again.', loggedOk: 'Receipt logged.', checkedOk: 'Marked as checked.', count: 'Count', weightPerUnit: 'Weight/unit', totalWeight: 'Total weight', palletCount: 'Pallets', bagsPerPallet: 'Bags/pallet', totalBags: 'Total bags', totalUnits: 'Total units' },
+    ar: { supplier: 'المورّد:', pallets: 'باليت', pallet: 'باليت', unit: 'وحدة', units: 'وحدة', bags: 'كيس', total: 'الإجمالي', received: 'تاريخ الاستلام', by: 'بواسطة', checked: 'تم الفحص', checkedBy: 'بواسطة', warehouse: 'المستودع', quality: 'الجودة', pending: 'بالانتظار', markChecked: 'وضع علامة تم الفحص', clearsIn: 'سيُحذف خلال', networkErr: 'تعذّر الوصول إلى الخادم. حاول مرة أخرى.', loggedOk: 'تم تسجيل الاستلام.', checkedOk: 'تم وضع علامة الفحص.', count: 'العدد', weightPerUnit: 'الوزن لكل وحدة', totalWeight: 'الوزن الإجمالي', palletCount: 'عدد البالتات', bagsPerPallet: 'كيس/بالتة', totalBags: 'إجمالي عدد الأكياس', totalUnits: 'إجمالي عدد الوحدات' },
   };
 
   function t(key) { return T[lang][key]; }
@@ -1172,43 +1178,59 @@ const HTML = `<!doctype html>
     return Number(n).toLocaleString(lang === 'ar' ? 'ar' : 'en-GB', { maximumFractionDigits: 2 });
   }
 
-  function itemLineText(item) {
-    const label = (PKG_LABEL[lang] && PKG_LABEL[lang][item.packaging_type]) || item.packaging_type;
+  // Returns [label, value] pairs for the given item's packaging type, so
+  // every number on a receipt card is explicitly labeled (count vs.
+  // weight-per-unit vs. total, etc.) instead of packed into an unlabeled
+  // shorthand string that's ambiguous at a glance.
+  function itemStats(item) {
     const wu = item.weight_unit || '';
     if (item.packaging_type === 'drum' || item.packaging_type === 'ibc') {
-      let s = label + ' ×' + fmtNum(item.qty_primary) + ' · ' + fmtNum(item.per_unit_weight) + ' ' + wu + '/' + t('unit');
-      if (item.total_weight != null) s += ' · ' + t('total') + ' ' + fmtNum(item.total_weight) + ' ' + wu;
-      return s;
+      const stats = [
+        [t('count'), fmtNum(item.qty_primary)],
+        [t('weightPerUnit'), fmtNum(item.per_unit_weight) + ' ' + wu],
+      ];
+      if (item.total_weight != null) stats.push([t('totalWeight'), fmtNum(item.total_weight) + ' ' + wu]);
+      return stats;
     }
     if (item.packaging_type === 'tank') {
-      return label + ' · ' + fmtNum(item.total_weight) + ' ' + wu;
+      return [[t('totalWeight'), fmtNum(item.total_weight) + ' ' + wu]];
     }
     if (item.packaging_type === 'bags_pallet') {
-      let s = label + ' · ' + fmtNum(item.qty_primary) + ' × ' + fmtNum(item.qty_secondary);
-      if (item.total_units != null) s += ' = ' + fmtNum(item.total_units) + ' ' + t('bags');
-      if (item.total_weight != null) s += ' · ' + fmtNum(item.total_weight) + ' ' + wu;
-      return s;
+      const stats = [
+        [t('palletCount'), fmtNum(item.qty_primary)],
+        [t('bagsPerPallet'), fmtNum(item.qty_secondary)],
+      ];
+      if (item.total_units != null) stats.push([t('totalBags'), fmtNum(item.total_units)]);
+      if (item.total_weight != null) stats.push([t('totalWeight'), fmtNum(item.total_weight) + ' ' + wu]);
+      return stats;
     }
     if (item.packaging_type === 'pallets') {
-      let s = label + ' · ' + fmtNum(item.qty_primary) + ' ' + t('pallets');
-      if (item.total_units != null) s += ' · ' + fmtNum(item.total_units) + ' ' + t('units');
-      return s;
+      const stats = [[t('palletCount'), fmtNum(item.qty_primary)]];
+      if (item.total_units != null) stats.push([t('totalUnits'), fmtNum(item.total_units)]);
+      return stats;
     }
-    return label;
+    return [];
+  }
+
+  function itemCardHtml(item) {
+    const label = (PKG_LABEL[lang] && PKG_LABEL[lang][item.packaging_type]) || item.packaging_type;
+    const statsHtml = itemStats(item)
+      .map(
+        ([k, v]) =>
+          '<span class="stat"><span class="stat-label">' + escapeHtml(k) + '</span><span class="stat-value mono">' + escapeHtml(v) + '</span></span>'
+      )
+      .join('');
+    return (
+      '<div class="item-card">' +
+      '<div class="item-card-head"><span class="mono item-code" dir="auto">' + escapeHtml(item.code) + '</span><span class="item-pkg">' + escapeHtml(label) + '</span></div>' +
+      '<div class="item-stats">' + statsHtml + '</div>' +
+      '</div>'
+    );
   }
 
   function receiptRow(r, checked) {
     const items = Array.isArray(r.items) ? r.items : [];
-    const itemsHtml = items
-      .map(
-        (item) =>
-          '<div class="item-line"><span class="mono">' +
-          escapeHtml(item.code) +
-          '</span><span>' +
-          escapeHtml(itemLineText(item)) +
-          '</span></div>'
-      )
-      .join('');
+    const itemsHtml = items.map(itemCardHtml).join('');
 
     const row = document.createElement('div');
     row.className = 'receipt-row' + (checked ? ' checked' : '');
@@ -1216,13 +1238,13 @@ const HTML = `<!doctype html>
       <div class="stripe"></div>
       <div class="receipt-body">
         <div class="receipt-top">
-          <span class="receipt-supplier">\${escapeHtml(r.supplier)}</span>
+          <span class="receipt-supplier" dir="auto">\${escapeHtml(r.supplier)}</span>
           <span class="status-pill">\${checked ? t('checked') : t('pending')}</span>
         </div>
         <div class="item-list">\${itemsHtml}</div>
         <div class="receipt-timestamps">
           <span>\${t('received')} <strong class="mono">\${fmtDate(r.received_at)}</strong></span>
-          \${r.received_by ? '<span>' + t('by') + ' <strong>' + escapeHtml(r.received_by) + '</strong></span>' : ''}
+          \${r.received_by ? '<span>' + t('by') + ' <strong dir="auto">' + escapeHtml(r.received_by) + '</strong></span>' : ''}
           \${checked ? '<span>' + t('checked') + ' <strong class="mono">' + fmtDate(r.checked_at) + '</strong></span>' : ''}
         </div>
       </div>
