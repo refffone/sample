@@ -304,8 +304,11 @@ export default {
 
       const receivedAt = new Date().toISOString();
       const insertReceipt = await env.DB.prepare(
-        `INSERT INTO receipts (supplier, received_by, received_at, note, status)
-         VALUES (?, ?, ?, ?, 'pending')`
+        // code/primary_unit/primary_qty/weight/weight_unit are obsolete NOT NULL
+        // columns from before receipts had line items; placeholder values keep
+        // old inserts valid without a destructive schema migration.
+        `INSERT INTO receipts (code, supplier, primary_unit, primary_qty, weight, weight_unit, received_by, received_at, note, status)
+         VALUES ('', ?, '', 0, 0, 'kg', ?, ?, ?, 'pending')`
       )
         .bind(supplier, receivedBy || null, receivedAt, note || null)
         .run();
