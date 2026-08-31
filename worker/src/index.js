@@ -207,12 +207,29 @@ export default {
       if (!role) return jsonResponse({ error: "Not authorized." }, 401);
       const status = url.searchParams.get("status") === "checked" ? "checked" : "pending";
       const orderCol = status === "checked" ? "checked_at" : "received_at";
-      const { results } = await env.DB.prepare(
+      const { results: receipts } = await env.DB.prepare(
         `SELECT * FROM receipts WHERE status = ? ORDER BY ${orderCol} DESC`
       )
         .bind(status)
         .all();
-      return jsonResponse({ receipts: results });
+
+      if (receipts.length > 0) {
+        const ids = receipts.map((r) => r.id);
+        const placeholders = ids.map(() => "?").join(",");
+        const { results: items } = await env.DB.prepare(
+          `SELECT * FROM receipt_items WHERE receipt_id IN (${placeholders}) ORDER BY id ASC`
+        )
+          .bind(...ids)
+          .all();
+        const itemsByReceipt = new Map();
+        for (const item of items) {
+          if (!itemsByReceipt.has(item.receipt_id)) itemsByReceipt.set(item.receipt_id, []);
+          itemsByReceipt.get(item.receipt_id).push(item);
+        }
+        for (const r of receipts) r.items = itemsByReceipt.get(r.id) || [];
+      }
+
+      return jsonResponse({ receipts });
     }
 
     if (request.method === "POST" && pathname === "/api/receipts") {
@@ -220,29 +237,100 @@ export default {
       if (!role) return jsonResponse({ error: "Not authorized." }, 401);
       const b = await request.json().catch(() => ({}));
 
-      const code = (b.code || "").trim();
       const supplier = (b.supplier || "").trim();
-      const primaryUnit = (b.primaryUnit || "").trim();
-      const primaryQty = Number(b.primaryQty);
-      const secondaryUnit = (b.secondaryUnit || "").trim();
-      const secondaryQty = b.secondaryQty === "" || b.secondaryQty == null ? null : Number(b.secondaryQty);
-      const weight = Number(b.weight);
-      const weightUnit = (b.weightUnit || "").trim();
-      const note = (b.note || "").trim();
       const receivedBy = (b.receivedBy || "").trim();
+      const note = (b.note || "").trim();
+      const items = Array.isArray(b.items) ? b.items : [];
 
-      if (!code || !supplier || !primaryUnit || !Number.isFinite(primaryQty) || !weightUnit || !Number.isFinite(weight)) {
-        return jsonResponse({ error: "Missing or invalid required fields." }, 400);
+      if (!supplier || items.length === 0) {
+        return jsonResponse({ error: "Supplier and at least one item are required." }, 400);
+      }
+
+      const preparedItems = [];
+      for (const raw of items) {
+        const code = (raw.code || "").trim();
+        const packagingType = (raw.packagingType || "").trim();
+        if (!code) return jsonResponse({ error: "Every item needs a material code." }, 400);
+
+        const num = (v) => (v === "" || v == null ? null : Number(v));
+        const weightUnit = (raw.weightUnit || "kg").trim();
+        let qtyPrimary = num(raw.qtyPrimary);
+        let qtySecondary = num(raw.qtySecondary);
+        let perUnitWeight = num(raw.perUnitWeight);
+        let totalUnits = num(raw.totalUnits);
+        let totalWeight = num(raw.totalWeight);
+
+        if (packagingType === "drum" || packagingType === "ibc") {
+          if (!Number.isFinite(qtyPrimary) || qtyPrimary <= 0 || !Number.isFinite(perUnitWeight) || perUnitWeight <= 0) {
+            return jsonResponse({ error: `${code}: count and weight per unit are required.` }, 400);
+          }
+          qtySecondary = null;
+          totalUnits = null;
+        } else if (packagingType === "tank") {
+          if (!Number.isFinite(totalWeight) || totalWeight <= 0) {
+            return jsonResponse({ error: `${code}: tank weight is required.` }, 400);
+          }
+          qtyPrimary = null;
+          qtySecondary = null;
+          perUnitWeight = null;
+          totalUnits = null;
+        } else if (packagingType === "bags_pallet") {
+          if (!Number.isFinite(qtyPrimary) || qtyPrimary <= 0 || !Number.isFinite(qtySecondary) || qtySecondary <= 0) {
+            return jsonResponse({ error: `${code}: pallet count and bags per pallet are required.` }, 400);
+          }
+          perUnitWeight = null;
+        } else if (packagingType === "pallets") {
+          if (!Number.isFinite(qtyPrimary) || qtyPrimary <= 0) {
+            return jsonResponse({ error: `${code}: pallet count is required.` }, 400);
+          }
+          qtySecondary = null;
+          perUnitWeight = null;
+          totalWeight = null;
+        } else {
+          return jsonResponse({ error: `${code}: unknown packaging type.` }, 400);
+        }
+
+        preparedItems.push({
+          code,
+          packagingType,
+          qtyPrimary,
+          qtySecondary,
+          perUnitWeight,
+          totalUnits,
+          totalWeight,
+          weightUnit: packagingType === "pallets" ? null : weightUnit,
+        });
       }
 
       const receivedAt = new Date().toISOString();
-      await env.DB.prepare(
-        `INSERT INTO receipts
-          (code, supplier, primary_unit, primary_qty, secondary_unit, secondary_qty, weight, weight_unit, note, received_by, received_at, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+      const insertReceipt = await env.DB.prepare(
+        `INSERT INTO receipts (supplier, received_by, received_at, note, status)
+         VALUES (?, ?, ?, ?, 'pending')`
       )
-        .bind(code, supplier, primaryUnit, primaryQty, secondaryUnit || null, secondaryQty, weight, weightUnit, note || null, receivedBy || null, receivedAt)
+        .bind(supplier, receivedBy || null, receivedAt, note || null)
         .run();
+      const receiptId = insertReceipt.meta.last_row_id;
+
+      const itemInsertSql = `INSERT INTO receipt_items
+          (receipt_id, code, packaging_type, qty_primary, qty_secondary, per_unit_weight, total_units, total_weight, weight_unit)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+      await env.DB.batch(
+        preparedItems.map((it) =>
+          env.DB
+            .prepare(itemInsertSql)
+            .bind(
+              receiptId,
+              it.code,
+              it.packagingType,
+              it.qtyPrimary,
+              it.qtySecondary,
+              it.perUnitWeight,
+              it.totalUnits,
+              it.totalWeight,
+              it.weightUnit
+            )
+        )
+      );
 
       ctx.waitUntil(notifyQuality(env));
 
@@ -297,7 +385,12 @@ export default {
 
   async scheduled(event, env, ctx) {
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    await env.DB.prepare(`DELETE FROM receipts WHERE status = 'checked' AND checked_at < ?`).bind(cutoff).run();
+    await env.DB.batch([
+      env.DB.prepare(
+        `DELETE FROM receipt_items WHERE receipt_id IN (SELECT id FROM receipts WHERE status = 'checked' AND checked_at < ?)`
+      ).bind(cutoff),
+      env.DB.prepare(`DELETE FROM receipts WHERE status = 'checked' AND checked_at < ?`).bind(cutoff),
+    ]);
   },
 };
 
@@ -453,6 +546,19 @@ const HTML = `<!doctype html>
   .field-grid .full { grid-column:1 / -1; }
   .unit-row { display:grid; grid-template-columns:1fr 96px; gap:8px; }
 
+  .item-block { background:var(--surface-sunken); border:1px solid var(--border); border-radius:12px; padding:16px; margin-top:16px; }
+  .item-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:14px; }
+  .item-number { font-family:'Barlow Condensed', system-ui, sans-serif; font-weight:600; font-size:1.05rem; letter-spacing:0.02em; color:var(--ink); }
+  body.lang-ar .item-number { font-family:'Noto Kufi Arabic', 'Barlow Condensed', sans-serif; }
+  .btn-remove-item { background:none; border:1px solid var(--border-strong); color:var(--danger); border-radius:7px; padding:5px 12px; font-size:0.8rem; font-weight:600; }
+  .btn-remove-item:hover { background:var(--danger); color:#fff; border-color:var(--danger); }
+
+  .btn-add-item { margin-top:14px; width:100%; background:var(--surface); border:1px dashed var(--border-strong); color:var(--accent); border-radius:10px; padding:11px; font-weight:600; font-size:0.9rem; }
+  .btn-add-item:hover { border-color:var(--accent); background:var(--accent-wash); }
+
+  .type-group { display:contents; }
+  .type-group[hidden] { display:none; }
+
   .form-actions { margin-top:18px; display:flex; align-items:center; justify-content:flex-end; gap:12px; flex-wrap:wrap; }
   .form-hint { font-size:0.78rem; color:var(--ink-soft); margin-inline-end:auto; }
 
@@ -475,14 +581,14 @@ const HTML = `<!doctype html>
   .receipt-body { grid-column:2; padding:13px 14px; display:flex; flex-direction:column; gap:7px; }
   @media (min-width:480px) { .receipt-body { padding:14px 16px; } }
   .receipt-top { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
-  .receipt-code { font-weight:600; font-size:0.92rem; color:var(--ink); }
+  .receipt-supplier { font-weight:600; font-size:0.95rem; color:var(--ink); }
 
   .status-pill { font-size:0.66rem; text-transform:uppercase; letter-spacing:0.08em; font-weight:700; padding:3px 9px; border-radius:999px; background:var(--pending-wash); color:var(--pending); }
   .receipt-row.checked .status-pill { background:var(--good-wash); color:var(--good); }
 
-  .receipt-meta { display:flex; flex-wrap:wrap; gap:4px 16px; font-size:0.83rem; color:var(--ink-soft); }
-  .receipt-meta .meta-item strong { color:var(--ink); font-weight:600; }
-  .receipt-meta .mono { color:var(--ink); }
+  .item-list { display:flex; flex-direction:column; gap:4px; }
+  .item-line { display:flex; flex-wrap:wrap; gap:4px 10px; font-size:0.83rem; color:var(--ink-soft); }
+  .item-line .mono { color:var(--ink); font-weight:600; flex:none; }
   .receipt-timestamps { font-size:0.76rem; color:var(--ink-soft); display:flex; gap:14px; flex-wrap:wrap; }
 
   .receipt-actions { grid-column:2; display:flex; align-items:center; padding:0 14px 13px; border-inline-start:none; border-top:1px solid var(--border); margin-top:2px; padding-top:11px; justify-content:flex-end; }
@@ -588,36 +694,8 @@ const HTML = `<!doctype html>
       <form id="receiptForm">
         <div class="field-grid">
           <div class="field">
-            <label data-en="Material Code" data-ar="رمز المادة">Material Code</label>
-            <input name="code" type="text" data-ph-en="e.g. RM-2201" data-ph-ar="مثال: RM-2201" placeholder="e.g. RM-2201" required />
-          </div>
-          <div class="field">
             <label data-en="Supplier" data-ar="المورّد">Supplier</label>
             <input name="supplier" type="text" data-ph-en="e.g. Nordic Resins BV" data-ph-ar="مثال: Nordic Resins BV" placeholder="e.g. Nordic Resins BV" required />
-          </div>
-          <div class="field">
-            <label data-en="Primary Unit" data-ar="الوحدة الأساسية">Primary Unit</label>
-            <div class="unit-row">
-              <input name="primaryUnit" type="text" data-ph-en="Pallet" data-ph-ar="باليت" placeholder="Pallet" required />
-              <input name="primaryQty" type="number" data-ph-en="Qty" data-ph-ar="الكمية" placeholder="Qty" min="0" step="1" required />
-            </div>
-          </div>
-          <div class="field">
-            <label data-en="Secondary Unit" data-ar="الوحدة الفرعية">Secondary Unit</label>
-            <div class="unit-row">
-              <input name="secondaryUnit" type="text" data-ph-en="Drum / Pail / Sack" data-ph-ar="برميل / دلو / كيس" placeholder="Drum / Pail / Sack" />
-              <input name="secondaryQty" type="number" data-ph-en="Per pallet" data-ph-ar="لكل باليت" placeholder="Per pallet" min="0" step="1" />
-            </div>
-          </div>
-          <div class="field">
-            <label data-en="Weight" data-ar="الوزن">Weight</label>
-            <div class="unit-row">
-              <input name="weight" type="number" placeholder="0.00" min="0" step="0.01" required />
-              <select name="weightUnit" aria-label="Weight unit">
-                <option value="kg" data-en="kg" data-ar="كجم">kg</option>
-                <option value="tonnes" data-en="tonnes" data-ar="طن">tonnes</option>
-              </select>
-            </div>
           </div>
           <div class="field">
             <label data-en="Received By (optional)" data-ar="استلمها (اختياري)">Received By (optional)</label>
@@ -628,6 +706,11 @@ const HTML = `<!doctype html>
             <input name="note" type="text" data-ph-en="Anything Quality should know" data-ph-ar="أي شيء يجب أن يعرفه قسم الجودة" placeholder="Anything Quality should know" />
           </div>
         </div>
+
+        <div id="itemsContainer"></div>
+
+        <button type="button" class="btn-add-item" id="addItemBtn" data-en="+ Add another item" data-ar="+ إضافة مادة أخرى">+ Add another item</button>
+
         <div class="form-actions">
           <span class="form-hint" data-en="Received at will be stamped automatically on submit." data-ar="سيتم تسجيل وقت الاستلام تلقائيًا عند الإرسال.">Received at will be stamped automatically on submit.</span>
           <button type="submit" class="btn-primary" id="submitBtn" data-en="Log Receipt" data-ar="تسجيل الاستلام">Log Receipt</button>
@@ -737,8 +820,8 @@ const HTML = `<!doctype html>
   }
 
   const T = {
-    en: { supplier: 'Supplier:', pallets: 'pallets', pallet: 'pallet', drumsPerPallet: 'drums/pallet', sacksPerPallet: 'sacks/pallet', received: 'Received', by: 'By', checked: 'Checked', checkedBy: 'by', warehouse: 'Warehouse', quality: 'Quality', pending: 'Pending', markChecked: 'Mark Checked', clearsIn: 'Clears in', networkErr: 'Could not reach the server. Try again.', loggedOk: 'Receipt logged.', checkedOk: 'Marked as checked.' },
-    ar: { supplier: 'المورّد:', pallets: 'باليت', pallet: 'باليت', drumsPerPallet: 'برميل/باليت', sacksPerPallet: 'كيس/باليت', received: 'تاريخ الاستلام', by: 'بواسطة', checked: 'تم الفحص', checkedBy: 'بواسطة', warehouse: 'المستودع', quality: 'الجودة', pending: 'بالانتظار', markChecked: 'وضع علامة تم الفحص', clearsIn: 'سيُحذف خلال', networkErr: 'تعذّر الوصول إلى الخادم. حاول مرة أخرى.', loggedOk: 'تم تسجيل الاستلام.', checkedOk: 'تم وضع علامة الفحص.' },
+    en: { supplier: 'Supplier:', pallets: 'pallets', pallet: 'pallet', unit: 'unit', units: 'units', bags: 'bags', total: 'Total', received: 'Received', by: 'By', checked: 'Checked', checkedBy: 'by', warehouse: 'Warehouse', quality: 'Quality', pending: 'Pending', markChecked: 'Mark Checked', clearsIn: 'Clears in', networkErr: 'Could not reach the server. Try again.', loggedOk: 'Receipt logged.', checkedOk: 'Marked as checked.' },
+    ar: { supplier: 'المورّد:', pallets: 'باليت', pallet: 'باليت', unit: 'وحدة', units: 'وحدة', bags: 'كيس', total: 'الإجمالي', received: 'تاريخ الاستلام', by: 'بواسطة', checked: 'تم الفحص', checkedBy: 'بواسطة', warehouse: 'المستودع', quality: 'الجودة', pending: 'بالانتظار', markChecked: 'وضع علامة تم الفحص', clearsIn: 'سيُحذف خلال', networkErr: 'تعذّر الوصول إلى الخادم. حاول مرة أخرى.', loggedOk: 'تم تسجيل الاستلام.', checkedOk: 'تم وضع علامة الفحص.' },
   };
 
   function t(key) { return T[lang][key]; }
@@ -812,6 +895,9 @@ const HTML = `<!doctype html>
       refreshTimer = setInterval(loadAll, 45000);
       setupPushSubscription();
     }
+    if (session.role === 'warehouse' && document.querySelectorAll('.item-block').length === 0) {
+      addItemBlock();
+    }
   }
 
   function signOut() {
@@ -823,6 +909,167 @@ const HTML = `<!doctype html>
     document.getElementById('pw').value = '';
   }
 
+  function itemBlockHtml() {
+    return \`
+      <div class="item-head">
+        <span class="item-number"><span data-en="Item" data-ar="مادة">Item</span> <span class="mono item-idx">1</span></span>
+        <button type="button" class="btn-remove-item" data-en="Remove" data-ar="إزالة">Remove</button>
+      </div>
+      <div class="field-grid">
+        <div class="field full">
+          <label data-en="Material Code" data-ar="رمز المادة">Material Code</label>
+          <input class="f-code" type="text" data-ph-en="e.g. RM-2201" data-ph-ar="مثال: RM-2201" placeholder="e.g. RM-2201" required />
+        </div>
+        <div class="field full">
+          <label data-en="Packaging" data-ar="نوع التعبئة">Packaging</label>
+          <select class="f-packaging">
+            <option value="drum" data-en="Drums" data-ar="براميل">Drums</option>
+            <option value="ibc" data-en="IBC" data-ar="تانك مكعب (IBC)">IBC</option>
+            <option value="tank" data-en="Tank" data-ar="فنطاس">Tank</option>
+            <option value="bags_pallet" data-en="Bags on Pallets" data-ar="شكاير على بالتة">Bags on Pallets</option>
+            <option value="pallets" data-en="Pallets" data-ar="بالتة">Pallets</option>
+          </select>
+        </div>
+
+        <div class="type-group tg-drum-ibc">
+          <div class="field">
+            <label data-en="Count" data-ar="العدد">Count</label>
+            <input class="f-qty-primary" type="number" min="0" step="1" />
+          </div>
+          <div class="field">
+            <label data-en="Weight per Unit" data-ar="الوزن لكل وحدة">Weight per Unit</label>
+            <div class="unit-row">
+              <input class="f-per-unit-weight" type="number" min="0" step="0.01" />
+              <select class="f-weight-unit">
+                <option value="kg" data-en="kg" data-ar="كجم">kg</option>
+                <option value="tonnes" data-en="tonnes" data-ar="طن">tonnes</option>
+              </select>
+            </div>
+          </div>
+          <div class="field full">
+            <label data-en="Total Weight (optional)" data-ar="الوزن الإجمالي (اختياري)">Total Weight (optional)</label>
+            <input class="f-total-weight" type="number" min="0" step="0.01" />
+          </div>
+        </div>
+
+        <div class="type-group tg-tank" hidden>
+          <div class="field full">
+            <label data-en="Tank Weight" data-ar="وزن الفنطاس">Tank Weight</label>
+            <div class="unit-row">
+              <input class="f-total-weight-tank" type="number" min="0" step="0.01" />
+              <select class="f-weight-unit-tank">
+                <option value="kg" data-en="kg" data-ar="كجم">kg</option>
+                <option value="tonnes" data-en="tonnes" data-ar="طن">tonnes</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="type-group tg-bags" hidden>
+          <div class="field">
+            <label data-en="Pallet Count" data-ar="عدد البالتات">Pallet Count</label>
+            <input class="f-qty-primary-bags" type="number" min="0" step="1" />
+          </div>
+          <div class="field">
+            <label data-en="Bags per Pallet" data-ar="عدد الأكياس لكل بالتة">Bags per Pallet</label>
+            <input class="f-qty-secondary" type="number" min="0" step="1" />
+          </div>
+          <div class="field">
+            <label data-en="Total Bags" data-ar="إجمالي عدد الأكياس">Total Bags</label>
+            <input class="f-total-units-bags" type="number" min="0" step="1" />
+          </div>
+          <div class="field">
+            <label data-en="Total Weight (optional)" data-ar="الوزن الإجمالي (اختياري)">Total Weight (optional)</label>
+            <div class="unit-row">
+              <input class="f-total-weight-bags" type="number" min="0" step="0.01" />
+              <select class="f-weight-unit-bags">
+                <option value="kg" data-en="kg" data-ar="كجم">kg</option>
+                <option value="tonnes" data-en="tonnes" data-ar="طن">tonnes</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="type-group tg-pallets" hidden>
+          <div class="field">
+            <label data-en="Pallet Count" data-ar="عدد البالتات">Pallet Count</label>
+            <input class="f-qty-primary-pallets" type="number" min="0" step="1" />
+          </div>
+          <div class="field">
+            <label data-en="Total Units (optional)" data-ar="إجمالي عدد الوحدات (اختياري)">Total Units (optional)</label>
+            <input class="f-total-units-pallets" type="number" min="0" step="1" />
+          </div>
+        </div>
+      </div>
+    \`;
+  }
+
+  const TYPE_GROUP_CLASS = { drum: 'tg-drum-ibc', ibc: 'tg-drum-ibc', tank: 'tg-tank', bags_pallet: 'tg-bags', pallets: 'tg-pallets' };
+
+  function bindAutoCalc(block) {
+    const qtyPrimary = block.querySelector('.f-qty-primary');
+    const perUnitWeight = block.querySelector('.f-per-unit-weight');
+    const totalWeight = block.querySelector('.f-total-weight');
+    let totalWeightEdited = false;
+    totalWeight.addEventListener('input', () => { totalWeightEdited = true; });
+    function recalcWeight() {
+      if (totalWeightEdited) return;
+      const q = parseFloat(qtyPrimary.value), p = parseFloat(perUnitWeight.value);
+      if (Number.isFinite(q) && Number.isFinite(p)) totalWeight.value = (q * p).toFixed(2);
+    }
+    qtyPrimary.addEventListener('input', recalcWeight);
+    perUnitWeight.addEventListener('input', recalcWeight);
+
+    const palletCount = block.querySelector('.f-qty-primary-bags');
+    const bagsPerPallet = block.querySelector('.f-qty-secondary');
+    const totalBags = block.querySelector('.f-total-units-bags');
+    let totalBagsEdited = false;
+    totalBags.addEventListener('input', () => { totalBagsEdited = true; });
+    function recalcBags() {
+      if (totalBagsEdited) return;
+      const a = parseFloat(palletCount.value), b = parseFloat(bagsPerPallet.value);
+      if (Number.isFinite(a) && Number.isFinite(b)) totalBags.value = Math.round(a * b);
+    }
+    palletCount.addEventListener('input', recalcBags);
+    bagsPerPallet.addEventListener('input', recalcBags);
+  }
+
+  function renumberItems() {
+    const blocks = document.querySelectorAll('.item-block');
+    blocks.forEach((block, i) => {
+      block.querySelector('.item-idx').textContent = i + 1;
+      block.querySelector('.btn-remove-item').hidden = blocks.length <= 1;
+    });
+  }
+
+  function addItemBlock() {
+    const wrap = document.createElement('div');
+    wrap.className = 'item-block';
+    wrap.innerHTML = itemBlockHtml();
+    document.getElementById('itemsContainer').appendChild(wrap);
+
+    const select = wrap.querySelector('.f-packaging');
+    function updateVisibility() {
+      wrap.querySelectorAll('.type-group').forEach((g) => { g.hidden = true; });
+      const cls = TYPE_GROUP_CLASS[select.value];
+      if (cls) wrap.querySelector('.' + cls).hidden = false;
+    }
+    select.addEventListener('change', updateVisibility);
+    updateVisibility();
+
+    wrap.querySelector('.btn-remove-item').addEventListener('click', () => {
+      if (document.querySelectorAll('.item-block').length <= 1) return;
+      wrap.remove();
+      renumberItems();
+    });
+
+    bindAutoCalc(wrap);
+    setLang(lang);
+    renumberItems();
+  }
+
+  document.getElementById('addItemBtn').addEventListener('click', addItemBlock);
+
   document.getElementById('receiptForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const form = e.target;
@@ -830,17 +1077,47 @@ const HTML = `<!doctype html>
     const toast = document.getElementById('formToast');
     toast.hidden = true;
     btn.disabled = true;
+
     const fd = new FormData(form);
+    const items = [];
+    document.querySelectorAll('.item-block').forEach((block) => {
+      const packagingType = block.querySelector('.f-packaging').value;
+      const code = block.querySelector('.f-code').value.trim();
+      const val = (sel) => { const el = block.querySelector(sel); return el ? el.value : ''; };
+      const item = { code, packagingType };
+      if (packagingType === 'drum' || packagingType === 'ibc') {
+        item.qtyPrimary = val('.f-qty-primary');
+        item.perUnitWeight = val('.f-per-unit-weight');
+        item.totalWeight = val('.f-total-weight');
+        item.weightUnit = val('.f-weight-unit');
+      } else if (packagingType === 'tank') {
+        item.totalWeight = val('.f-total-weight-tank');
+        item.weightUnit = val('.f-weight-unit-tank');
+      } else if (packagingType === 'bags_pallet') {
+        item.qtyPrimary = val('.f-qty-primary-bags');
+        item.qtySecondary = val('.f-qty-secondary');
+        item.totalUnits = val('.f-total-units-bags');
+        item.totalWeight = val('.f-total-weight-bags');
+        item.weightUnit = val('.f-weight-unit-bags');
+      } else if (packagingType === 'pallets') {
+        item.qtyPrimary = val('.f-qty-primary-pallets');
+        item.totalUnits = val('.f-total-units-pallets');
+      }
+      items.push(item);
+    });
+
     const body = {
-      code: fd.get('code'), supplier: fd.get('supplier'),
-      primaryUnit: fd.get('primaryUnit'), primaryQty: fd.get('primaryQty'),
-      secondaryUnit: fd.get('secondaryUnit'), secondaryQty: fd.get('secondaryQty'),
-      weight: fd.get('weight'), weightUnit: fd.get('weightUnit'),
-      receivedBy: fd.get('receivedBy'), note: fd.get('note'),
+      supplier: fd.get('supplier'),
+      receivedBy: fd.get('receivedBy'),
+      note: fd.get('note'),
+      items,
     };
+
     try {
       await api('/api/receipts', { method: 'POST', body: JSON.stringify(body) });
       form.reset();
+      document.getElementById('itemsContainer').innerHTML = '';
+      addItemBlock();
       toast.textContent = t('loggedOk');
       toast.className = 'form-toast ok';
       toast.hidden = false;
@@ -853,23 +1130,63 @@ const HTML = `<!doctype html>
     }
   });
 
+  const PKG_LABEL = {
+    en: { drum: 'Drums', ibc: 'IBC', tank: 'Tank', bags_pallet: 'Bags on Pallets', pallets: 'Pallets' },
+    ar: { drum: 'براميل', ibc: 'تانك مكعب (IBC)', tank: 'فنطاس', bags_pallet: 'شكاير على بالتة', pallets: 'بالتة' },
+  };
+
+  function fmtNum(n) {
+    return Number(n).toLocaleString(lang === 'ar' ? 'ar' : 'en-GB', { maximumFractionDigits: 2 });
+  }
+
+  function itemLineText(item) {
+    const label = (PKG_LABEL[lang] && PKG_LABEL[lang][item.packaging_type]) || item.packaging_type;
+    const wu = item.weight_unit || '';
+    if (item.packaging_type === 'drum' || item.packaging_type === 'ibc') {
+      let s = label + ' ×' + fmtNum(item.qty_primary) + ' · ' + fmtNum(item.per_unit_weight) + ' ' + wu + '/' + t('unit');
+      if (item.total_weight != null) s += ' · ' + t('total') + ' ' + fmtNum(item.total_weight) + ' ' + wu;
+      return s;
+    }
+    if (item.packaging_type === 'tank') {
+      return label + ' · ' + fmtNum(item.total_weight) + ' ' + wu;
+    }
+    if (item.packaging_type === 'bags_pallet') {
+      let s = label + ' · ' + fmtNum(item.qty_primary) + ' × ' + fmtNum(item.qty_secondary);
+      if (item.total_units != null) s += ' = ' + fmtNum(item.total_units) + ' ' + t('bags');
+      if (item.total_weight != null) s += ' · ' + fmtNum(item.total_weight) + ' ' + wu;
+      return s;
+    }
+    if (item.packaging_type === 'pallets') {
+      let s = label + ' · ' + fmtNum(item.qty_primary) + ' ' + t('pallets');
+      if (item.total_units != null) s += ' · ' + fmtNum(item.total_units) + ' ' + t('units');
+      return s;
+    }
+    return label;
+  }
+
   function receiptRow(r, checked) {
-    const unitsLine = r.primary_qty + ' ' + (r.primary_qty === 1 ? t('pallet') : t('pallets')) +
-      (r.secondary_unit ? ' · ' + r.secondary_qty + ' ' + r.secondary_unit : '');
+    const items = Array.isArray(r.items) ? r.items : [];
+    const itemsHtml = items
+      .map(
+        (item) =>
+          '<div class="item-line"><span class="mono">' +
+          escapeHtml(item.code) +
+          '</span><span>' +
+          escapeHtml(itemLineText(item)) +
+          '</span></div>'
+      )
+      .join('');
+
     const row = document.createElement('div');
     row.className = 'receipt-row' + (checked ? ' checked' : '');
     row.innerHTML = \`
       <div class="stripe"></div>
       <div class="receipt-body">
         <div class="receipt-top">
-          <span class="receipt-code mono">\${escapeHtml(r.code)}</span>
+          <span class="receipt-supplier">\${escapeHtml(r.supplier)}</span>
           <span class="status-pill">\${checked ? t('checked') : t('pending')}</span>
         </div>
-        <div class="receipt-meta">
-          <span class="meta-item">\${t('supplier')} <strong>\${escapeHtml(r.supplier)}</strong></span>
-          <span class="meta-item mono">\${escapeHtml(unitsLine)}</span>
-          <span class="meta-item mono">\${Number(r.weight).toLocaleString()} \${escapeHtml(r.weight_unit)}</span>
-        </div>
+        <div class="item-list">\${itemsHtml}</div>
         <div class="receipt-timestamps">
           <span>\${t('received')} <strong class="mono">\${fmtDate(r.received_at)}</strong></span>
           \${r.received_by ? '<span>' + t('by') + ' <strong>' + escapeHtml(r.received_by) + '</strong></span>' : ''}
