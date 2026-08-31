@@ -296,7 +296,7 @@ export default {
   },
 };
 
-const HTML = String.raw`<!doctype html>
+const HTML = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
