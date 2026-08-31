@@ -28,6 +28,26 @@ self.addEventListener('fetch', (e) => {
     fetch(e.request).catch(() => caches.match(e.request))
   );
 });
+self.addEventListener('push', (e) => {
+  e.waitUntil(
+    self.registration.showNotification('Receiving Log', {
+      body: 'A new receipt was logged and is pending your check.',
+      icon: '/icon.jpg',
+      badge: '/icon.jpg',
+      tag: 'receiving-log-pending',
+      renotify: true,
+    })
+  );
+});
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  e.waitUntil(
+    clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
+      for (const c of list) { if ('focus' in c) return c.focus(); }
+      if (clients.openWindow) return clients.openWindow('/');
+    })
+  );
+});
 `;
 
 function b64ToBytes(b64) {
@@ -81,6 +101,68 @@ async function requireRole(request, env, role) {
   const actualRole = await verifyToken(token, env.AUTH_SECRET);
   if (!actualRole || actualRole !== role) return null;
   return actualRole;
+}
+
+const VAPID_PUBLIC_KEY = "BH7ZGoJT-Ssi9BcvKr35G5zjmcyqlzmCqsedhzhXRZPDpCLTVJ1vKrUXAWTARrpWdz1Zcfcdn4UTqGlSGNNFScE";
+
+function bytesToB64url(bytes) {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function vapidAuthHeader(endpoint, env) {
+  const aud = new URL(endpoint).origin;
+  const header = { typ: "JWT", alg: "ES256" };
+  const payload = {
+    aud,
+    exp: Math.floor(Date.now() / 1000) + 12 * 3600,
+    sub: env.VAPID_SUBJECT || "mailto:admin@example.com",
+  };
+  const encHeader = bytesToB64url(new TextEncoder().encode(JSON.stringify(header)));
+  const encPayload = bytesToB64url(new TextEncoder().encode(JSON.stringify(payload)));
+  const signingInput = `${encHeader}.${encPayload}`;
+  const key = await crypto.subtle.importKey(
+    "jwk",
+    JSON.parse(env.VAPID_PRIVATE_KEY_JWK),
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    key,
+    new TextEncoder().encode(signingInput)
+  );
+  const jwt = `${signingInput}.${bytesToB64url(new Uint8Array(sig))}`;
+  return `vapid t=${jwt}, k=${VAPID_PUBLIC_KEY}`;
+}
+
+// Sends a payload-less push: it just wakes the service worker, which shows a
+// generic "new receipt" notification. Avoids implementing full Web Push
+// message encryption (RFC 8291) for a one-line alert.
+async function sendWebPush(subscription, env) {
+  const authHeader = await vapidAuthHeader(subscription.endpoint, env);
+  return fetch(subscription.endpoint, {
+    method: "POST",
+    headers: { Authorization: authHeader, TTL: "3600" },
+  });
+}
+
+async function notifyQuality(env) {
+  const { results } = await env.DB.prepare("SELECT * FROM push_subscriptions WHERE role = 'quality'").all();
+  await Promise.all(
+    results.map(async (sub) => {
+      try {
+        const res = await sendWebPush(sub, env);
+        if (res.status === 404 || res.status === 410) {
+          await env.DB.prepare("DELETE FROM push_subscriptions WHERE id = ?").bind(sub.id).run();
+        }
+      } catch {
+        // best effort — a failed push must never break receipt logging
+      }
+    })
+  );
 }
 
 export default {
@@ -157,7 +239,37 @@ export default {
         .bind(code, supplier, primaryUnit, primaryQty, secondaryUnit || null, secondaryQty, weight, weightUnit, note || null, receivedBy || null, receivedAt)
         .run();
 
+      ctx.waitUntil(notifyQuality(env));
+
       return jsonResponse({ ok: true, receivedAt });
+    }
+
+    if (request.method === "POST" && pathname === "/api/push/subscribe") {
+      const role = await requireRole(request, env, "quality");
+      if (!role) return jsonResponse({ error: "Not authorized." }, 401);
+      const b = await request.json().catch(() => ({}));
+      const sub = b.subscription;
+      if (!sub || !sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) {
+        return jsonResponse({ error: "Invalid subscription." }, 400);
+      }
+      await env.DB.prepare(
+        `INSERT INTO push_subscriptions (role, endpoint, p256dh, auth, created_at)
+         VALUES ('quality', ?, ?, ?, ?)
+         ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth`
+      )
+        .bind(sub.endpoint, sub.keys.p256dh, sub.keys.auth, new Date().toISOString())
+        .run();
+      return jsonResponse({ ok: true });
+    }
+
+    if (request.method === "POST" && pathname === "/api/push/unsubscribe") {
+      const role = await requireRole(request, env, "quality");
+      if (!role) return jsonResponse({ error: "Not authorized." }, 401);
+      const b = await request.json().catch(() => ({}));
+      if (b.endpoint) {
+        await env.DB.prepare("DELETE FROM push_subscriptions WHERE endpoint = ?").bind(b.endpoint).run();
+      }
+      return jsonResponse({ ok: true });
     }
 
     const checkMatch = pathname.match(/^\/api\/receipts\/(\d+)\/check$/);
@@ -250,6 +362,19 @@ const HTML = String.raw`<!doctype html>
   .lang-toggle:hover { border-color:var(--accent); color:var(--accent); }
   .lang-toggle:focus-visible { outline:2px solid var(--focus); outline-offset:2px; }
   .lang-toggle svg { width:14px; height:14px; flex:none; }
+
+  .install-btn { background:var(--accent-wash); border-color:transparent; color:var(--accent); }
+  .install-btn:hover { border-color:var(--accent); }
+
+  .ios-note {
+    position:fixed; inset-inline:12px; bottom:calc(12px + env(safe-area-inset-bottom));
+    max-width:420px; margin-inline:auto; z-index:20;
+    background:var(--surface); border:1px solid var(--border-strong); border-radius:12px;
+    padding:12px 14px; display:flex; align-items:flex-start; gap:10px;
+    font-size:0.82rem; color:var(--ink); box-shadow:0 8px 24px rgba(0,0,0,0.16);
+  }
+  .ios-note button { background:none; border:none; color:var(--ink-soft); font-size:1.1rem; line-height:1; padding:0 2px; flex:none; }
+  .ios-note button:hover { color:var(--ink); }
 
   .login-shell { min-height:60vh; display:flex; align-items:center; justify-content:center; }
   .login-card {
@@ -375,16 +500,27 @@ const HTML = String.raw`<!doctype html>
 </head>
 <body>
 
+<div class="ios-note" id="iosNote" hidden>
+  <span data-en="On iPhone/iPad: tap the Share icon, then &quot;Add to Home Screen&quot;." data-ar="على آيفون/آيباد: اضغط على أيقونة المشاركة، ثم &quot;إضافة إلى الشاشة الرئيسية&quot;.">On iPhone/iPad: tap the Share icon, then "Add to Home Screen".</span>
+  <button type="button" onclick="document.getElementById('iosNote').hidden = true" aria-label="Dismiss">&times;</button>
+</div>
+
 <div class="app-wrap" id="loginScreen">
   <div class="minibar">
     <div class="minibrand">
       <img src="/icon.jpg" alt="4M Coatings" />
       <span data-en="Receiving Log" data-ar="سجل الاستلام">Receiving Log</span>
     </div>
-    <button class="lang-toggle" type="button" onclick="setLang(lang==='ar'?'en':'ar')">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 6 3.8 9s-1.3 6.3-3.8 9c-2.5-2.7-3.8-6-3.8-9s1.3-6.3 3.8-9z"/></svg>
-      <span id="langToggleLabel">العربية</span>
-    </button>
+    <div style="display:flex; align-items:center; gap:8px;">
+      <button class="lang-toggle install-btn" type="button" id="installBtnLogin" onclick="triggerInstall()" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>
+        <span data-en="Add to Home Screen" data-ar="إضافة إلى الشاشة الرئيسية">Add to Home Screen</span>
+      </button>
+      <button class="lang-toggle" type="button" onclick="setLang(lang==='ar'?'en':'ar')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 6 3.8 9s-1.3 6.3-3.8 9c-2.5-2.7-3.8-6-3.8-9s1.3-6.3 3.8-9z"/></svg>
+        <span id="langToggleLabel">العربية</span>
+      </button>
+    </div>
   </div>
 
   <div class="login-shell">
@@ -428,6 +564,10 @@ const HTML = String.raw`<!doctype html>
         <span class="role-badge" id="roleBadge">—</span>
         <button class="signout" type="button" data-en="Sign out" data-ar="تسجيل الخروج" onclick="signOut()">Sign out</button>
       </div>
+      <button class="lang-toggle install-btn" type="button" id="installBtnApp" onclick="triggerInstall()" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>
+        <span data-en="Add to Home Screen" data-ar="إضافة إلى الشاشة الرئيسية">Add to Home Screen</span>
+      </button>
       <button class="lang-toggle" type="button" onclick="setLang(lang==='ar'?'en':'ar')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 6 3.8 9s-1.3 6.3-3.8 9c-2.5-2.7-3.8-6-3.8-9s1.3-6.3 3.8-9z"/></svg>
         <span id="langToggleLabel2">العربية</span>
@@ -523,9 +663,73 @@ const HTML = String.raw`<!doctype html>
 </div>
 
 <script>
+  const VAPID_PUBLIC_KEY = 'BH7ZGoJT-Ssi9BcvKr35G5zjmcyqlzmCqsedhzhXRZPDpCLTVJ1vKrUXAWTARrpWdz1Zcfcdn4UTqGlSGNNFScE';
+
   let lang = 'en';
   let session = null; // { role, token }
   let refreshTimer = null;
+  let deferredInstallPrompt = null;
+
+  function isStandalone() {
+    return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+  }
+  function isIos() {
+    return /iphone|ipad|ipod/i.test(navigator.userAgent) && !window.MSStream;
+  }
+
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredInstallPrompt = e;
+    if (!isStandalone()) {
+      document.getElementById('installBtnLogin').hidden = false;
+      document.getElementById('installBtnApp').hidden = false;
+    }
+  });
+  window.addEventListener('appinstalled', () => {
+    deferredInstallPrompt = null;
+    document.getElementById('installBtnLogin').hidden = true;
+    document.getElementById('installBtnApp').hidden = true;
+  });
+
+  function triggerInstall() {
+    if (deferredInstallPrompt) {
+      deferredInstallPrompt.prompt();
+      deferredInstallPrompt.userChoice.finally(() => { deferredInstallPrompt = null; });
+      return;
+    }
+    if (isIos()) {
+      document.getElementById('iosNote').hidden = false;
+    }
+  }
+
+  function urlBase64ToUint8Array(base64String) {
+    const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(base64);
+    const out = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+
+  async function setupPushSubscription() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        if (Notification.permission === 'denied') return;
+        const perm = await Notification.requestPermission();
+        if (perm !== 'granted') return;
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+        });
+      }
+      await api('/api/push/subscribe', { method: 'POST', body: JSON.stringify({ subscription: sub.toJSON() }) });
+    } catch (err) {
+      console.warn('Push subscription failed', err);
+    }
+  }
 
   const T = {
     en: { supplier: 'Supplier:', pallets: 'pallets', pallet: 'pallet', drumsPerPallet: 'drums/pallet', sacksPerPallet: 'sacks/pallet', received: 'Received', by: 'By', checked: 'Checked', checkedBy: 'by', warehouse: 'Warehouse', quality: 'Quality', pending: 'Pending', markChecked: 'Mark Checked', clearsIn: 'Clears in', networkErr: 'Could not reach the server. Try again.', loggedOk: 'Receipt logged.', checkedOk: 'Marked as checked.' },
@@ -601,6 +805,7 @@ const HTML = String.raw`<!doctype html>
     if (session.role === 'quality') {
       loadAll();
       refreshTimer = setInterval(loadAll, 45000);
+      setupPushSubscription();
     }
   }
 
@@ -727,6 +932,10 @@ const HTML = String.raw`<!doctype html>
     let savedLang = 'en';
     try { savedLang = localStorage.getItem('rl_lang') || 'en'; } catch {}
     setLang(savedLang);
+    if (isIos() && !isStandalone()) {
+      document.getElementById('installBtnLogin').hidden = false;
+      document.getElementById('installBtnApp').hidden = false;
+    }
     try {
       const saved = localStorage.getItem('rl_session');
       if (saved) { session = JSON.parse(saved); enterApp(); }

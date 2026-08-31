@@ -13,6 +13,9 @@ crons = ["0 * * * *"]
 
 # Secrets (set with `wrangler secret put <NAME>`, or in the dashboard
 # under Settings -> Variables and Secrets — do NOT put real values here):
-#   WAREHOUSE_PASSWORD
-#   QUALITY_PASSWORD
-#   AUTH_SECRET
+#   WAREHOUSE_PASSWORD     shared password for the Warehouse role
+#   QUALITY_PASSWORD       shared password for the Quality role
+#   AUTH_SECRET            any long random string, signs login tokens
+#   VAPID_PRIVATE_KEY_JWK  private key for push notifications (see README)
+#   VAPID_SUBJECT          "mailto:you@yourcompany.com" — contact info push
+#                          services may use if there's a delivery problem
