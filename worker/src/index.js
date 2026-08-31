@@ -464,6 +464,15 @@ const HTML = `<!doctype html>
   .lang-toggle:focus-visible { outline:2px solid var(--focus); outline-offset:2px; }
   .lang-toggle svg { width:14px; height:14px; flex:none; }
 
+  /* Fixed to a physical corner (not inset-inline-*), and forced ltr, so this
+     group never swaps sides or reorders when direction flips RTL/LTR —
+     otherwise the language button jumps screens on every switch and a
+     second click lands nowhere. */
+  .corner-controls {
+    position:fixed; top:calc(12px + env(safe-area-inset-top)); right:calc(12px + env(safe-area-inset-right)); z-index:30;
+    display:flex; align-items:center; gap:8px; direction:ltr;
+  }
+
   .install-btn { background:var(--accent-wash); border-color:transparent; color:var(--accent); }
   .install-btn:hover { border-color:var(--accent); }
 
@@ -625,12 +634,12 @@ const HTML = `<!doctype html>
       <img src="/logo.png" alt="4M Coatings" />
       <span data-en="Receiving Log" data-ar="سجل الاستلام">Receiving Log</span>
     </div>
-    <div style="display:flex; align-items:center; gap:8px;">
+    <div class="corner-controls">
       <button class="lang-toggle install-btn" type="button" id="installBtnLogin" onclick="triggerInstall()" hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>
         <span data-en="Add to Home Screen" data-ar="إضافة إلى الشاشة الرئيسية">Add to Home Screen</span>
       </button>
-      <button class="lang-toggle" type="button" onclick="setLang(lang==='ar'?'en':'ar')">
+      <button class="lang-toggle" type="button" onclick="toggleLang()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 6 3.8 9s-1.3 6.3-3.8 9c-2.5-2.7-3.8-6-3.8-9s1.3-6.3 3.8-9z"/></svg>
         <span id="langToggleLabel">العربية</span>
       </button>
@@ -678,16 +687,19 @@ const HTML = `<!doctype html>
         <span class="role-badge" id="roleBadge">—</span>
         <button class="signout" type="button" data-en="Sign out" data-ar="تسجيل الخروج" onclick="signOut()">Sign out</button>
       </div>
-      <button class="lang-toggle install-btn" type="button" id="installBtnApp" onclick="triggerInstall()" hidden>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>
-        <span data-en="Add to Home Screen" data-ar="إضافة إلى الشاشة الرئيسية">Add to Home Screen</span>
-      </button>
-      <button class="lang-toggle" type="button" onclick="setLang(lang==='ar'?'en':'ar')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 6 3.8 9s-1.3 6.3-3.8 9c-2.5-2.7-3.8-6-3.8-9s1.3-6.3 3.8-9z"/></svg>
-        <span id="langToggleLabel2">العربية</span>
-      </button>
     </div>
   </header>
+
+  <div class="corner-controls">
+    <button class="lang-toggle install-btn" type="button" id="installBtnApp" onclick="triggerInstall()" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>
+      <span data-en="Add to Home Screen" data-ar="إضافة إلى الشاشة الرئيسية">Add to Home Screen</span>
+    </button>
+    <button class="lang-toggle" type="button" onclick="toggleLang()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 6 3.8 9s-1.3 6.3-3.8 9c-2.5-2.7-3.8-6-3.8-9s1.3-6.3 3.8-9z"/></svg>
+      <span id="langToggleLabel2">العربية</span>
+    </button>
+  </div>
 
   <div class="appbody">
 
@@ -841,6 +853,17 @@ const HTML = `<!doctype html>
     if (l2) l2.textContent = l === 'ar' ? 'English' : 'العربية';
     if (session) renderRoleBadge();
     try { localStorage.setItem('rl_lang', l); } catch {}
+  }
+
+  // Called from onclick="toggleLang()" rather than inlining the ternary in
+  // the attribute itself: every HTMLElement has its own .lang IDL property
+  // (reflecting the lang="" content attribute), and inline event handler
+  // attributes resolve bare identifiers against the element before the
+  // page's script scope — so a bare lang inside onclick=\"...\" silently
+  // reads the button's own (always-empty) .lang property, not this script's
+  // lang variable, and the toggle never advances past its first click.
+  function toggleLang() {
+    setLang(lang === 'ar' ? 'en' : 'ar');
   }
 
   function renderRoleBadge() {
